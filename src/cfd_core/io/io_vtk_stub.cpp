@@ -1,18 +1,31 @@
 #include "cfd_core/io_vtk.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <fstream>
+#include <type_traits>
 
 namespace cfd::core {
 namespace {
+template <typename T>
+void write_ascii_value(std::ofstream& out, const T& value) {
+  if constexpr (std::is_same_v<T, std::uint8_t> || std::is_same_v<T, std::int8_t> ||
+                std::is_same_v<T, char> || std::is_same_v<T, signed char> ||
+                std::is_same_v<T, unsigned char>) {
+    out << static_cast<int>(value);
+  } else {
+    out << value;
+  }
+}
+
 template <typename T>
 void write_ascii_data_array(std::ofstream& out, const std::vector<T>& values) {
   for (std::size_t i = 0; i < values.size(); ++i) {
     if (i > 0) {
       out << ' ';
     }
-    out << values[i];
+    write_ascii_value(out, values[i]);
   }
 }
 }  // namespace
