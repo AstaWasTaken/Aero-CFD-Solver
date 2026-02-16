@@ -1,5 +1,6 @@
 #include "cfd_core/solvers/euler_solver.hpp"
 
+#include "cfd_core/backend.hpp"
 #include "cfd_core/io_vtk.hpp"
 #include "cfd_core/numerics/euler_flux.hpp"
 #include "cfd_core/numerics/reconstruction.hpp"
@@ -14,11 +15,18 @@
 #include <string>
 #include <vector>
 
+#if CFD_HAS_CUDA
+#include "cfd_core/cuda_backend.hpp"
+#endif
+
 namespace cfd::core {
 namespace {
 constexpr float kPi = 3.14159265358979323846f;
 constexpr float kRhoFloor = 1.0e-8f;
 constexpr float kPressureFloor = 1.0e-8f;
+constexpr int kFaceBoundaryInterior = 0;
+constexpr int kFaceBoundaryFarfield = 1;
+constexpr int kFaceBoundaryWall = 2;
 
 ConservativeState load_conservative_state(const std::vector<float>& conserved, const int cell) {
   return {
@@ -78,6 +86,25 @@ bool is_farfield_patch(const std::string& patch_name) {
   return patch_name == "farfield" || patch_name == "boundary";
 }
 
+std::vector<int> build_face_boundary_type(const UnstructuredMesh& mesh) {
+  std::vector<int> face_boundary_type(static_cast<std::size_t>(mesh.num_faces), kFaceBoundaryInterior);
+  const std::vector<std::string> face_patch_name = build_face_patch_name(mesh);
+  for (int face = 0; face < mesh.num_faces; ++face) {
+    if (mesh.face_neighbor[face] >= 0) {
+      continue;
+    }
+    const std::string& patch = face_patch_name[static_cast<std::size_t>(face)];
+    if (is_wall_patch(patch)) {
+      face_boundary_type[static_cast<std::size_t>(face)] = kFaceBoundaryWall;
+    } else if (is_farfield_patch(patch) || patch.empty()) {
+      face_boundary_type[static_cast<std::size_t>(face)] = kFaceBoundaryFarfield;
+    } else {
+      face_boundary_type[static_cast<std::size_t>(face)] = kFaceBoundaryFarfield;
+    }
+  }
+  return face_boundary_type;
+}
+
 float compute_cfl(const EulerAirfoilCaseConfig& config, const int iter) {
   if (config.cfl_ramp_iters <= 0) {
     return config.cfl_max;
@@ -106,18 +133,93 @@ std::array<float, 5> slip_wall_flux(const ConservativeState& interior,
     0.0f,
   };
 }
+
+void assemble_euler_residual_cpu(const UnstructuredMesh& mesh,
+                                 const std::vector<PrimitiveState>& primitive,
+                                 const PrimitiveGradients& gradients,
+                                 const std::vector<int>& face_boundary_type,
+                                 const ConservativeState& conservative_inf, const float gamma,
+                                 const bool use_second_order, std::vector<float>* residual,
+                                 std::vector<float>* spectral_radius) {
+  if (residual == nullptr || spectral_radius == nullptr) {
+    return;
+  }
+
+  for (int face = 0; face < mesh.num_faces; ++face) {
+    const int owner = mesh.face_owner[face];
+    const int neighbor = mesh.face_neighbor[face];
+    const std::array<float, 3> normal = {
+      mesh.face_normal[3 * face + 0],
+      mesh.face_normal[3 * face + 1],
+      mesh.face_normal[3 * face + 2],
+    };
+    const float area = mesh.face_area[face];
+
+    ConservativeState left_state;
+    ConservativeState right_state;
+    std::array<float, 5> flux = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float max_wave_speed = 0.0f;
+
+    if (neighbor >= 0) {
+      PrimitiveState left_primitive = primitive[static_cast<std::size_t>(owner)];
+      PrimitiveState right_primitive = primitive[static_cast<std::size_t>(neighbor)];
+      if (use_second_order) {
+        reconstruct_interior_face_states(mesh, primitive, gradients, face, LimiterType::kMinmod,
+                                         &left_primitive, &right_primitive);
+      }
+      left_state = primitive_to_conservative(left_primitive, gamma);
+      right_state = primitive_to_conservative(right_primitive, gamma);
+      flux = rusanov_flux(left_state, right_state, normal, gamma, &max_wave_speed);
+    } else {
+      const PrimitiveState owner_primitive = primitive[static_cast<std::size_t>(owner)];
+      left_state = primitive_to_conservative(owner_primitive, gamma);
+      const int bc_type = face_boundary_type[static_cast<std::size_t>(face)];
+      if (bc_type == kFaceBoundaryWall) {
+        flux = slip_wall_flux(left_state, normal, gamma, &max_wave_speed);
+      } else {
+        right_state = conservative_inf;
+        flux = rusanov_flux(left_state, right_state, normal, gamma, &max_wave_speed);
+      }
+    }
+
+    const float wave = max_wave_speed * area;
+    (*spectral_radius)[static_cast<std::size_t>(owner)] += wave;
+    for (int k = 0; k < 5; ++k) {
+      const float flux_area = flux[k] * area;
+      (*residual)[static_cast<std::size_t>(5 * owner + k)] += flux_area;
+      if (neighbor >= 0) {
+        (*residual)[static_cast<std::size_t>(5 * neighbor + k)] -= flux_area;
+      }
+    }
+
+    if (neighbor >= 0) {
+      (*spectral_radius)[static_cast<std::size_t>(neighbor)] += wave;
+    }
+  }
+}
+
+#if CFD_HAS_CUDA
+struct EulerCudaBuffersGuard {
+  cfd::cuda_backend::EulerDeviceBuffers buffers;
+
+  ~EulerCudaBuffersGuard() {
+    cfd::cuda_backend::free_euler_device_buffers(&buffers);
+  }
+};
+#endif
 }  // namespace
 
-EulerRunResult run_euler_airfoil_case_cpu(const EulerAirfoilCaseConfig& config) {
+EulerRunResult run_euler_airfoil_case(const EulerAirfoilCaseConfig& config,
+                                      const std::string& backend) {
   if (config.iterations <= 0) {
     throw std::invalid_argument("Euler iterations must be positive.");
   }
+  const std::string resolved_backend = normalize_backend(backend);
 
   EulerRunResult result;
   result.mesh = make_airfoil_ogrid_mesh(config.mesh);
 
   const int num_cells = result.mesh.num_cells;
-  const int num_faces = result.mesh.num_faces;
   const float gamma = config.gamma;
 
   float rho_inf = config.rho_inf;
@@ -149,9 +251,11 @@ EulerRunResult run_euler_airfoil_case_cpu(const EulerAirfoilCaseConfig& config) 
   std::vector<float> residual(static_cast<std::size_t>(num_cells) * 5, 0.0f);
   std::vector<float> spectral_radius(static_cast<std::size_t>(num_cells), 0.0f);
   std::vector<float> cell_pressure(static_cast<std::size_t>(num_cells), config.p_inf);
+  result.last_residual.assign(static_cast<std::size_t>(num_cells) * 5, 0.0f);
+  result.last_spectral_radius.assign(static_cast<std::size_t>(num_cells), 0.0f);
   result.residual_magnitude.assign(static_cast<std::size_t>(num_cells), 0.0f);
+  const std::vector<int> face_boundary_type = build_face_boundary_type(result.mesh);
 
-  const std::vector<std::string> face_patch_name = build_face_patch_name(result.mesh);
   const FreestreamReference reference = {
     rho_inf,
     config.p_inf,
@@ -184,6 +288,17 @@ EulerRunResult run_euler_airfoil_case_cpu(const EulerAirfoilCaseConfig& config) 
   constexpr int kForceStableWindow = 6;
   float cfl_scale = 1.0f;
 
+#if CFD_HAS_CUDA
+  EulerCudaBuffersGuard cuda_buffers_guard;
+  if (resolved_backend == "cuda") {
+    std::string error_message;
+    if (!cfd::cuda_backend::init_euler_device_buffers(
+          result.mesh, face_boundary_type, &cuda_buffers_guard.buffers, &error_message)) {
+      throw std::runtime_error("CUDA Euler buffer initialization failed: " + error_message);
+    }
+  }
+#endif
+
   for (int iter = 0; iter < config.iterations; ++iter) {
     for (int cell = 0; cell < num_cells; ++cell) {
       primitive[static_cast<std::size_t>(cell)] =
@@ -201,64 +316,29 @@ EulerRunResult run_euler_airfoil_case_cpu(const EulerAirfoilCaseConfig& config) 
     std::fill(residual.begin(), residual.end(), 0.0f);
     std::fill(spectral_radius.begin(), spectral_radius.end(), 0.0f);
     std::fill(result.residual_magnitude.begin(), result.residual_magnitude.end(), 0.0f);
+    if (resolved_backend == "cpu") {
+      assemble_euler_residual_cpu(result.mesh, primitive, gradients, face_boundary_type,
+                                  conservative_inf, gamma, use_second_order, &residual,
+                                  &spectral_radius);
+    } else {
+#if CFD_HAS_CUDA
+      cfd::cuda_backend::EulerResidualConfig cuda_config;
+      cuda_config.gamma = gamma;
+      cuda_config.use_second_order = use_second_order;
+      cuda_config.farfield_state = conservative_inf;
 
-    for (int face = 0; face < num_faces; ++face) {
-      const int owner = result.mesh.face_owner[face];
-      const int neighbor = result.mesh.face_neighbor[face];
-      const std::array<float, 3> normal = {
-        result.mesh.face_normal[3 * face + 0],
-        result.mesh.face_normal[3 * face + 1],
-        result.mesh.face_normal[3 * face + 2],
-      };
-      const float area = result.mesh.face_area[face];
-
-      ConservativeState left_state;
-      ConservativeState right_state;
-      std::array<float, 5> flux = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-      float max_wave_speed = 0.0f;
-
-      if (neighbor >= 0) {
-        PrimitiveState left_primitive = primitive[static_cast<std::size_t>(owner)];
-        PrimitiveState right_primitive = primitive[static_cast<std::size_t>(neighbor)];
-        if (use_second_order) {
-          reconstruct_interior_face_states(result.mesh, primitive, gradients, face,
-                                           LimiterType::kMinmod, &left_primitive,
-                                           &right_primitive);
-        }
-        left_state = primitive_to_conservative(left_primitive, gamma);
-        right_state = primitive_to_conservative(right_primitive, gamma);
-        flux = rusanov_flux(left_state, right_state, normal, gamma, &max_wave_speed);
-      } else {
-        const PrimitiveState owner_primitive = primitive[static_cast<std::size_t>(owner)];
-        left_state = primitive_to_conservative(owner_primitive, gamma);
-
-        const std::string& patch = face_patch_name[static_cast<std::size_t>(face)];
-        if (is_wall_patch(patch)) {
-          flux = slip_wall_flux(left_state, normal, gamma, &max_wave_speed);
-        } else if (is_farfield_patch(patch) || patch.empty()) {
-          right_state = conservative_inf;
-          flux = rusanov_flux(left_state, right_state, normal, gamma, &max_wave_speed);
-        } else {
-          right_state = conservative_inf;
-          flux = rusanov_flux(left_state, right_state, normal, gamma, &max_wave_speed);
-        }
+      std::string error_message;
+      if (!cfd::cuda_backend::euler_residual_cuda(
+            result.mesh, cuda_config, &cuda_buffers_guard.buffers, result.conserved.data(),
+            gradients.values.data(), residual.data(), spectral_radius.data(), &error_message)) {
+        throw std::runtime_error("CUDA Euler residual failed: " + error_message);
       }
-
-      const float wave = max_wave_speed * area;
-      spectral_radius[static_cast<std::size_t>(owner)] += wave;
-
-      for (int k = 0; k < 5; ++k) {
-        const float flux_area = flux[k] * area;
-        residual[static_cast<std::size_t>(5 * owner + k)] += flux_area;
-        if (neighbor >= 0) {
-          residual[static_cast<std::size_t>(5 * neighbor + k)] -= flux_area;
-        }
-      }
-
-      if (neighbor >= 0) {
-        spectral_radius[static_cast<std::size_t>(neighbor)] += wave;
-      }
+#else
+      throw std::runtime_error("CUDA backend requested but unavailable.");
+#endif
     }
+    result.last_residual = residual;
+    result.last_spectral_radius = spectral_radius;
 
     double residual_l1 = 0.0;
     double residual_l2_sum = 0.0;
@@ -389,7 +469,13 @@ EulerRunResult run_euler_airfoil_case_cpu(const EulerAirfoilCaseConfig& config) 
   }
 
   // TODO(numerics): Add HLLC/Roe options behind the same face-loop interface.
-  // TODO(cuda): Port Euler face-loop kernels once CPU formulation is validated.
+  // TODO(cuda): Keep state and residual resident on GPU across pseudo-time iterations.
+  // TODO(cuda): Move gradient computation to GPU.
+  // TODO(cuda): Add implicit/JFNK paths that reuse the GPU residual operator.
   return result;
+}
+
+EulerRunResult run_euler_airfoil_case_cpu(const EulerAirfoilCaseConfig& config) {
+  return run_euler_airfoil_case(config, "cpu");
 }
 }  // namespace cfd::core

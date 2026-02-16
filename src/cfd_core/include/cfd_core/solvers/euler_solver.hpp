@@ -2,9 +2,11 @@
 
 #include "cfd_core/mesh.hpp"
 #include "cfd_core/mesh/airfoil_mesh.hpp"
+#include "cfd_core/numerics/euler_flux.hpp"
 #include "cfd_core/post/forces.hpp"
 
 #include <filesystem>
+#include <string>
 #include <vector>
 
 namespace cfd::core {
@@ -42,6 +44,8 @@ struct EulerIterationRecord {
 struct EulerRunResult {
   UnstructuredMesh mesh;
   std::vector<float> conserved;  // [cell][rho,rhou,rhov,rhow,rhoE]
+  std::vector<float> last_residual;       // [cell][rho,rhou,rhov,rhow,rhoE]
+  std::vector<float> last_spectral_radius;
   std::vector<float> residual_magnitude;
   std::vector<float> rho;
   std::vector<float> u;
@@ -57,5 +61,7 @@ struct EulerRunResult {
   std::filesystem::path vtu_path;
 };
 
+EulerRunResult run_euler_airfoil_case(const EulerAirfoilCaseConfig& config,
+                                      const std::string& backend = "cpu");
 EulerRunResult run_euler_airfoil_case_cpu(const EulerAirfoilCaseConfig& config);
 }  // namespace cfd::core

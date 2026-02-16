@@ -35,6 +35,9 @@ bool compute_scalar_residual_cuda(const cfd::core::UnstructuredMesh& mesh,
     }
     return false;
   }
+  if (!cuda_runtime_available(error_message)) {
+    return false;
+  }
 
   int* d_face_owner = nullptr;
   int* d_face_neighbor = nullptr;

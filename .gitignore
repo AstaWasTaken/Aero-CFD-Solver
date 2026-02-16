@@ -1,5 +1,6 @@
 # Build artifacts
 /build/
+/build_*/
 /build-*/
 CMakeCache.txt
 CMakeFiles/
@@ -22,7 +23,10 @@ __pycache__/
 # IDE/editor
 .vscode/
 .idea/
+.vs/
 *.swp
+CMakeSettings.json
+/out/
 
 # Project Outline
 CFD_Solver_Project_Outline.pdf

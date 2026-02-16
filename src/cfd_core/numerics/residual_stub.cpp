@@ -251,7 +251,7 @@ std::array<float, 3> get_vec3(const std::unordered_map<std::string, std::string>
 namespace cfd::core {
 bool cuda_available() {
 #if CFD_HAS_CUDA
-  return true;
+  return cfd::cuda_backend::cuda_runtime_available(nullptr);
 #else
   return false;
 #endif
@@ -271,8 +271,8 @@ std::string normalize_backend(std::string requested_backend) {
 
   if (requested_backend == "cuda" && !cuda_available()) {
     throw std::runtime_error(
-      "CUDA backend requested but unavailable. Reconfigure with a CUDA compiler and "
-      "-DCFD_ENABLE_CUDA=ON.");
+      "CUDA backend requested but unavailable. Build with -DCFD_ENABLE_CUDA=ON and ensure a "
+      "CUDA-capable device is visible.");
   }
 
   return requested_backend;
@@ -352,10 +352,6 @@ RunSummary run_case(const std::string& case_path, const std::string& out_dir,
   const std::filesystem::path run_log_path = output_dir / "run.log";
 
   if (case_type == "euler_airfoil_2d") {
-    if (resolved_backend != "cpu") {
-      throw std::runtime_error("euler_airfoil_2d currently supports backend=cpu only.");
-    }
-
     EulerAirfoilCaseConfig euler_config;
     euler_config.output_dir = output_dir;
     euler_config.iterations = get_int(case_kv, "iterations", euler_config.iterations);
@@ -391,7 +387,7 @@ RunSummary run_case(const std::string& case_path, const std::string& out_dir,
     euler_config.mesh.radial_stretch =
       get_float(case_kv, "radial_stretch", euler_config.mesh.radial_stretch);
 
-    const EulerRunResult euler_result = run_euler_airfoil_case_cpu(euler_config);
+    const EulerRunResult euler_result = run_euler_airfoil_case(euler_config, resolved_backend);
     const EulerIterationRecord& final_record = euler_result.history.back();
 
     {

@@ -39,6 +39,7 @@ endif()
 if(CFD_CUDA_AVAILABLE)
   add_subdirectory(cuda)
   target_link_libraries(cfd_core_lib PUBLIC cfd_cuda_backend)
+  set_target_properties(cfd_core_lib PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
 endif()
 
 install(TARGETS cfd_core_lib
